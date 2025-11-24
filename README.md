@@ -30,3 +30,7 @@ Serial Communication (UART)
 Channel Monitoring Firmware
 
 Signal Testing & Debugging Tools
+
+DEMO:
+
+https://youtube.com/shorts/w3QYUp0lP1k?si=S5aA4ZNC1CHuQirX
