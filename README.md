@@ -10,7 +10,7 @@ Sistem Interface Nurse Call 108 Channel yang dilengkapi dengan:
 
 Sistem ini dirancang untuk pengembangan Nurse Call skala besar hingga 108 channel, cocok untuk rumah sakit, klinik, maupun laboratorium pengujian perangkat.
 
-🎯 Fitur Utama yang Ditampilkan dalam Video
+🎯 Fitur Utama:
 
 ✔ Monitoring 108 input channel dengan kecepatan tinggi
 ✔ Penomoran channel otomatis dan akurat
