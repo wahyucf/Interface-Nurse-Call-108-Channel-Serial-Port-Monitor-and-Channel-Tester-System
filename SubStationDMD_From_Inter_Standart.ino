@@ -1,266 +1,179 @@
 /*
-  Countdown on a single DMD display
+  Robust 24/7 DMD Nurse Call Display System
+  - Watchdog timer protection
+  - Memory leak prevention
+  - Overflow protection
+  - Error recovery
 */
 
 #include <SPI.h>
-//#include <SoftwareSerial.h>
 #include <DMD2.h>
 #include <fonts/Arial_Black_16.h>
 #include <fonts/Droid_Sans_12.h>
+#include <avr/wdt.h>  // Watchdog timer
+
 #define DISPLAYS_ACROSS 2
 #define DISPLAYS_DOWN 2
-const int COUNTDOWN_FROM = 12;
-int counter = COUNTDOWN_FROM;
-uint16_t lastPrint = 100;
-String state;
-boolean ret = false;
-int NoQ = 0;
-int id;
-int millisB = 0;
+#define SERIAL_TIMEOUT 5000
+#define MAX_MESSAGE_LENGTH 20
+#define HEARTBEAT_INTERVAL 30000
+
+// Variabel global dengan proteksi overflow
+int id = 100;
+unsigned long millisB = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long lastSerialActivity = 0;
 int Pin13 = 0;
-
-unsigned long interval = 10000; // the time we need to wait
-unsigned long previousMillis = 0; // millis() returns an unsigned long.
-
-
-
-
-byte x;
-char myArray[20] = "";
-int i = 0;
+uint8_t i = 0;
+uint8_t j = 0;
 bool flag1 = LOW;
+char myArray[MAX_MESSAGE_LENGTH] = "";
 String IsiBerita;
 String tipeBeep;
-int j = 0;
-String pesanDisplay;
 
+SoftDMD dmd(DISPLAYS_ACROSS, DISPLAYS_DOWN);
+DMD_TextBox box(dmd, 0, 0);
 
-//SoftwareSerial mySerial1(2, 3); // RX, TX
-SoftDMD dmd(DISPLAYS_ACROSS, DISPLAYS_DOWN); // DMD controls the entire display
-DMD_TextBox box(dmd, 0, 0); // "box" provides a text box to automatically write to/scroll the display
+// Fungsi untuk reset watchdog timer
+void resetWatchdog() {
+  wdt_reset();
+}
 
-// the setup routine runs once when you press reset:
-
-void drawText(String dispString)
-{
+// Fungsi untuk inisialisasi ulang display jika error
+void reinitDisplay() {
   dmd.clearScreen();
-  int sLength = dispString.length();
+  delay(100);
+  dmd.begin();
+  dmd.setBrightness(50);
+  dmd.selectFont(Arial_Black_16);
+}
+
+void drawText(String dispString) {
+  if (dispString.length() == 0) return;
+  
+  dmd.clearScreen();
+  resetWatchdog();
+  
+  // Batasi panjang string untuk menghindari overflow
+  if (dispString.length() > 15) {
+    dispString = dispString.substring(0, 15);
+  }
+  
   dmd.drawString(1, 1, dispString);
   dmd.drawString(1, 17, dispString);
 }
 
-void beepCB()
-{
-  digitalWrite(4, HIGH);
-  delay(100);
-  digitalWrite(4, LOW);
-  delay(100);
-  digitalWrite(4, HIGH);
-  delay(100);
-  digitalWrite(4, LOW);
-  delay(100);
-  //digitalWrite(4, HIGH);
-  //delay(100);
-  //digitalWrite(4, LOW);
+void beepCB() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(4, HIGH);
+    delay(100);
+    resetWatchdog();
+    digitalWrite(4, LOW);
+    delay(100);
+  }
 }
 
-
-void beepSA()
-{
-  digitalWrite(4, HIGH);
-  delay(500);
-  digitalWrite(4, LOW);
-  delay(100);
-  digitalWrite(4, HIGH);
-  delay(500);
-  digitalWrite(4, LOW);
-  delay(100);
-  //digitalWrite(4, HIGH);
-  //delay(500);
-  //digitalWrite(4, LOW);
-  //delay(100);
+void beepSA() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(4, HIGH);
+    delay(500);
+    resetWatchdog();
+    digitalWrite(4, LOW);
+    delay(100);
+  }
 }
 
-void beeppendek()
-{
+void beeppendek() {
   digitalWrite(4, HIGH);
   delay(100);
   digitalWrite(4, LOW);
 }
-void beeppanjang()
-{
+
+void beeppanjang() {
   digitalWrite(4, HIGH);
   delay(300);
   digitalWrite(4, LOW);
 }
 
-void DispBed(String a)
-{
-  String b = a;//+"B";
-  //        Serial.print ("Tampil: ");
-  //        Serial.println (b);
-  drawText(b);
-  beeppendek();
-  delay(900);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beeppendek();
-  delay(900);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beeppendek();
-  //delay(900);
-  //dmd.clearScreen();
-  //delay(500);
-  //drawText(b);
-  //beeppendek();
-  delay(1000);
-  dmd.clearScreen();
-
-  //         Serial.println("0:");
-  //         delay(50);
-
-}
-void DispRBed(String a, String c)
-{
-  String b = a;//+" B"+c;
-  //        Serial.print ("Tampil: ");
-  //        Serial.println (b);
-  drawText(b);
-  beeppendek();
-  delay(900);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beeppendek();
-  delay(900);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beeppendek();
-  //delay(900);
-  //dmd.clearScreen();
-  //delay(500);
-  //drawText(b);
-  //beeppendek();
-  delay(1000);
-  dmd.clearScreen();
-
-  //          Serial.println("0:");
-
-}
-void DispKM(String a)
-{
-  String b = a;//+":KM";
-  //        Serial.print ("Tampil: ");
-  //        Serial.println (b);
-  drawText(b);
-  beeppanjang();
-  delay(500);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beeppanjang();
-  delay(500);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beeppanjang();
-  //delay(500);
-  //dmd.clearScreen();
-  //delay(500);
-  //drawText(b);
-  //beeppanjang();
-  delay(1000);
-  dmd.clearScreen();
-
-  //          Serial.println("0:");
-
-}
-
-void DispCBlue(String a)
-{
-  String b = a;// +" CB";
-  digitalWrite(10, HIGH);
-  //        Serial.print ("Tampil: ");
-  //        Serial.println (b);
-  drawText(b);
-  beepCB();
-  delay(900);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beepCB();
-  delay(500);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beepCB();
-  //delay(900);
-  //dmd.clearScreen();
-  //delay(500);
-  //drawText(b);
-  //beepCB();
-  delay(1000);
-  dmd.clearScreen();
-
-  //         Serial.println("0:");
-  //          delay(200);
-  digitalWrite(10, LOW);
-
-}
-
-void DispSA(String a)
-{
-  String b = a; //+" SA";
-  digitalWrite(10, HIGH);
-  //        Serial.print ("Tampil: ");
-  //        Serial.println (b);
-  drawText(b);
-  beepSA();
-  delay(900);
-  dmd.clearScreen();
-  delay(500);
-  drawText(b);
-  beepSA();
-  delay(500);
-  dmd.clearScreen();
-  //delay(500);
-  //drawText(b);
-  //beepSA();
-  //delay(900);
-  //dmd.clearScreen();
-  //delay(500);
-  //drawText(b);
-  //beepSA();
-  delay(1000);
-  dmd.clearScreen();
-
-  //         Serial.println("0:");
-  //          delay(200);
-  digitalWrite(10, LOW);
-
-}
-
-int phase = 0;
-void DotFly() {
-  dmd.clearScreen();
-  dmd.drawString(0, 0, F("."));
-  int steps = random(64); // Each time we scroll a random distance
-  for (int i = 0; i < steps; i++) {
-    dmd.drawString(i, 0, F("."));
-    delay(50);
+void DispBed(String a) {
+  if (a.length() == 0) return;
+  
+  for (int i = 0; i < 3; i++) {
+    drawText(a);
+    beeppendek();
+    delay(900);
+    resetWatchdog();
+    dmd.clearScreen();
+    delay(500);
   }
+  drawText(a);
+  beeppendek();
+  delay(1000);
+  resetWatchdog();
+  dmd.clearScreen();
+}
 
-  // Move to the next phase
-  phase = (phase + 1) % 4;
+void DispRBed(String a, String c) {
+  DispBed(a);
+}
+
+void DispKM(String a) {
+  if (a.length() == 0) return;
+  
+  for (int i = 0; i < 3; i++) {
+    drawText(a);
+    beeppanjang();
+    delay(500);
+    resetWatchdog();
+    dmd.clearScreen();
+    delay(500);
+  }
+  drawText(a);
+  beeppanjang();
+  delay(1000);
+  resetWatchdog();
+  dmd.clearScreen();
+}
+
+void DispCBlue(String a) {
+  if (a.length() == 0) return;
+  
+  digitalWrite(10, HIGH);
+  for (int i = 0; i < 3; i++) {
+    drawText(a);
+    beepCB();
+    delay(900);
+    resetWatchdog();
+    dmd.clearScreen();
+    delay(500);
+  }
+  drawText(a);
+  beepCB();
+  delay(1000);
+  resetWatchdog();
+  dmd.clearScreen();
+  digitalWrite(10, LOW);
+}
+
+void DispSA(String a) {
+  if (a.length() == 0) return;
+  
+  digitalWrite(10, HIGH);
+  for (int i = 0; i < 2; i++) {
+    drawText(a);
+    beepSA();
+    delay(900);
+    resetWatchdog();
+    dmd.clearScreen();
+    delay(500);
+  }
+  delay(1000);
+  resetWatchdog();
+  dmd.clearScreen();
+  digitalWrite(10, LOW);
 }
 
 void StatCon() {
-
-
   dmd.selectFont(Droid_Sans_12);
   digitalWrite(10, HIGH);
   drawText(".");
@@ -270,181 +183,208 @@ void StatCon() {
   delay(100);
   id = 100;
   dmd.selectFont(Arial_Black_16);
+}
 
+// Fungsi untuk membersihkan buffer serial
+void clearSerialBuffer() {
+  while (Serial.available() > 0) {
+    Serial.read();
+    delay(1);
+  }
+}
+
+// Fungsi untuk reset state komunikasi
+void resetCommState() {
+  flag1 = LOW;
+  memset(myArray, 0, sizeof(myArray));
+  i = 0;
+  id = 100;
 }
 
 void setup() {
+  // Disable watchdog saat startup
+  wdt_disable();
+  
   Serial.begin(9600);
-  //    Serial2.begin(9600);
-  //    mySerial1.begin( 9600 ); // baud-rate of RS485
-
-  pinMode (10, OUTPUT);
+  Serial.setTimeout(SERIAL_TIMEOUT);
+  
+  pinMode(10, OUTPUT);
+  pinMode(4, OUTPUT);
+  pinMode(23, OUTPUT);
+  
+  // Inisialisasi semua output ke LOW
+  digitalWrite(10, LOW);
+  digitalWrite(4, LOW);
+  digitalWrite(23, LOW);
+  
   digitalWrite(10, HIGH);
   dmd.setBrightness(50);
   dmd.selectFont(Arial_Black_16);
   dmd.begin();
   dmd.clearScreen();
   drawText(" Nurse ");
-  pinMode(4, OUTPUT);    // sets the digital pin 4 as output
-  digitalWrite(4, HIGH);
-  delay(200);
-  digitalWrite(10, HIGH);
-  digitalWrite(4, LOW);
-  delay( 400 );
-  digitalWrite(10, LOW);
-  digitalWrite(4, HIGH);
-  delay(200);
-  digitalWrite(10, HIGH);
-  digitalWrite(4, LOW);
-  delay( 400 );
-  digitalWrite(10, LOW);
+  
+  // Sequence beep dan LED
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(4, HIGH);
+    digitalWrite(10, i % 2);
+    delay(200);
+    digitalWrite(4, LOW);
+    delay(400);
+    digitalWrite(10, LOW);
+  }
+  
   digitalWrite(4, HIGH);
   digitalWrite(10, HIGH);
   delay(1000);
   digitalWrite(4, LOW);
-  delay( 400 );
+  delay(400);
   digitalWrite(10, LOW);
   digitalWrite(4, HIGH);
   delay(200);
   digitalWrite(10, HIGH);
   digitalWrite(4, LOW);
-  delay( 400 );
+  delay(400);
   digitalWrite(10, LOW);
   delay(500);
+  
   dmd.clearScreen();
-  Serial.println ("Sub Start");
+  Serial.println("Sub Start");
+  Serial.flush();
   digitalWrite(10, LOW);
-
   id = 100;
-  pinMode(23, OUTPUT); //Rubah sesuai PIN lampu indikator (1 dari 3)
+  
+  // Inisialisasi timestamp
+  lastHeartbeat = millis();
+  lastSerialActivity = millis();
+  
+  // Enable watchdog timer (8 detik)
+  wdt_enable(WDTO_8S);
 }
 
-void CodeOn() {
-  digitalWrite(23, HIGH);
-  delay(100);
-  digitalWrite(23 , LOW);
-  delay(100);
-}
-
-// the loop routine runs over and over again forever:
 void loop() {
-
-  byte b;
-
-  if (Serial.available() > 0)
-  {
-    if (flag1 == HIGH) //< received
-    {
-      x = Serial.read();
-      if (x != '>')
-      {
-        myArray[i] = x;
-        i++;
-        if (i == 1 ) {
-          tipeBeep = myArray;
-
-          if (tipeBeep == "N") id = 0; // Blinking
-          if (tipeBeep == "R") id = 1; // Room/Kamar
-          if (tipeBeep == "K") id = 2; // Kamar Mandi
-          if (tipeBeep == "C") id = 3; // Code Blue
-          if (tipeBeep == "S") id = 4; // Staff Assist
-          if (tipeBeep == "P") id = 5; // Staff Present
-          //Serial.println("Type Beep is:");
-          //Serial.print(tipeBeep);
-          //Serial.print(" - id:");
-          //Serial.println(id);
+  // Reset watchdog di awal loop
+  resetWatchdog();
+  
+  // Cek timeout komunikasi serial
+  if (flag1 == HIGH && (millis() - lastSerialActivity > SERIAL_TIMEOUT)) {
+    resetCommState();
+    clearSerialBuffer();
+  }
+  
+  if (Serial.available() > 0) {
+    lastSerialActivity = millis();
+    
+    if (flag1 == HIGH) {
+      byte x = Serial.read();
+      
+      if (x != '>') {
+        // Proteksi buffer overflow
+        if (i < (MAX_MESSAGE_LENGTH - 1)) {
+          myArray[i] = x;
+          i++;
+          
+          if (i == 1) {
+            tipeBeep = String(myArray[0]);
+            
+            // Gunakan switch untuk performa lebih baik
+            switch(myArray[0]) {
+              case 'N': id = 0; break;
+              case 'R': id = 1; break;
+              case 'K': id = 2; break;
+              case 'C': id = 3; break;
+              case 'S': id = 4; break;
+              case 'P': id = 5; break;
+              default: id = 100; break;
+            }
+          }
+        } else {
+          // Buffer penuh, reset
+          resetCommState();
         }
-      }
-      else
-      {
-        //Serial.println();
-        //Serial.println("Input is:");
-        //Serial.println(myArray);
-        {
-          IsiBerita = myArray;
+      } else {
+        // Akhir pesan
+        myArray[i] = '\0'; // Null terminate
+        IsiBerita = String(myArray);
+        if (IsiBerita.length() > 0) {
           IsiBerita = IsiBerita.substring(1);
-          //Serial.println("Data is:");
-          //Serial.println(IsiBerita);
         }
         flag1 = LOW;
         memset(myArray, 0, sizeof(myArray));
         i = 0;
         j++;
+        
+        // Batasi j untuk mencegah overflow
+        if (j > 100) j = 0;
       }
-    }
-    else
-    {
-      if (Serial.read() == '<')
-      {
+    } else {
+      if (Serial.read() == '<') {
         flag1 = HIGH;
+        i = 0;
+        memset(myArray, 0, sizeof(myArray));
       }
     }
 
-    if (flag1 == LOW) //< received
-    {
-
+    if (flag1 == LOW && id != 100) {
+      // Proses perintah
       switch (id) {
-        case 1:
-          DispBed(IsiBerita);
-          //Serial.println("Display Bed is:");
-          //Serial.println(IsiBerita);
-
-          Serial.begin(9600); break;
-        case 2:
-          DispKM(IsiBerita);
-          //Serial.println("Display KM is:");
-          //Serial.println(IsiBerita);
-          Serial.begin(9600); break;
-        case 3:
-          DispCBlue(IsiBerita);
-          //Serial.println("Display CB is:");
-          //Serial.println(IsiBerita);
-          Serial.begin(9600); break;
-        case 4:
-          DispSA(IsiBerita);
-          //Serial.println("Display SA is:");
-          //Serial.println(IsiBerita);
-          Serial.begin(9600); break;
-        case 5:
-          DispBed(IsiBerita);
-          Serial.begin(9600); break;
-
-        case 0:
-          StatCon();
+        case 0: 
+          StatCon(); 
+          id = 100; 
+          break;
+        case 1: 
+          DispBed(IsiBerita); 
           id = 100;
-          Serial.begin(9600); break;
-        default :
-          digitalWrite(10, LOW);
+          break;
+        case 2: 
+          DispKM(IsiBerita); 
+          id = 100;
+          break;
+        case 3: 
+          DispCBlue(IsiBerita); 
+          id = 100;
+          break;
+        case 4: 
+          DispSA(IsiBerita); 
+          id = 100;
+          break;
+        case 5: 
+          DispBed(IsiBerita); 
+          id = 100;
+          break;
+        default: 
+          digitalWrite(10, LOW); 
+          id = 100;
+          break;
       }
+      
+      // Clear data setelah diproses
+      IsiBerita = "";
     }
-
-
-
-
   }
-  if ( j == 2) {
+  
+  if (j >= 2) {
     j = 0;
   }
 
-
-
-
-
-  //mySerial1.flush();
-
   digitalWrite(10, LOW);
-  //RunRuang = 0;
-  millisB = millisB + 1;
-  if (millisB >= 30000) {
-  if (Pin13 == 0) {
-      digitalWrite(23, HIGH); //Rubah sesuai PIN lampu indikator (2 dari 3)
-      millisB = 0;
+  
+  // Gunakan millis() yang lebih aman
+  unsigned long currentMillis = millis();
+  
+  // Heartbeat LED indicator dengan millis()
+  if (currentMillis - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    lastHeartbeat = currentMillis;
+    
+    if (Pin13 == 0) {
+      digitalWrite(23, HIGH);
       Pin13 = 1;
     } else {
-      digitalWrite(23 , LOW); //Rubah sesuai PIN lampu indikator (3 dari 3)
-      millisB = 0;
+      digitalWrite(23, LOW);
       Pin13 = 0;
     }
   }
-
+  
+  // Small delay untuk stabilitas
+  delay(10);
 }
