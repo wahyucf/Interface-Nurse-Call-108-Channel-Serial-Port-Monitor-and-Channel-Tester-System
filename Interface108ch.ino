@@ -2,6 +2,7 @@
 //  MULTIPLEXER MONITOR 7×16 – 24/7 ROBUST EDITION
 //  Fitur identik dengan versi sebelumnya, hanya tambahan:
 //   - Watchdog, CRC, baseline auto-recal, LED status, dll.
+//   - NILAI ANALOG pada setiap pin aktif
 // ============================================================
 #include <avr/wdt.h>
 #include <EEPROM.h>
@@ -36,6 +37,7 @@ struct ChannelStatus {
   bool active;
   uint8_t stableHigh, stableLow, readCount;
   uint16_t sumReadings;
+  int lastAnalogValue;  // TAMBAHAN: simpan nilai analog terakhir
 };
 ChannelStatus channels[NUM_MUX][CHANNELS_PER_MUX];
 
@@ -128,9 +130,21 @@ void sendSerial(const __FlashStringHelper *prefix, int val) {
   //Serial.print(':');              // delimiter
   //Serial.println(crc, HEX);
 }
-void sendEvent(bool active, int pin) {
+
+// MODIFIKASI: Tambahkan parameter analogValue
+void sendEvent(bool active, int pin, int analogValue) {
   if (pin < 1 || pin > TOTAL_CHANNELS) return;
-  sendSerial(active ? F("10%d") : F("90%d"), pin);
+  
+  // Format: 10<pin>:<analogValue> atau 90<pin>
+  if (active) {
+    Serial.print(F("10"));
+    Serial.print(pin);
+    Serial.print(':');
+    Serial.println(analogValue);
+  } else {
+    Serial.print(F("90"));
+    Serial.println(pin);
+  }
 }
 
 // ---------- BASELINE CALIBRATE ----------
@@ -208,6 +222,9 @@ ISR(TIMER1_COMPA_vect) {
     int avg = st.sumReadings / 3;
     bool prev = st.active;
 
+    // TAMBAHAN: Simpan nilai analog terakhir
+    st.lastAnalogValue = avg;
+
     if (avg > THRESHOLD_HIGH) {
       st.stableHigh++;
       st.stableLow = 0;
@@ -218,7 +235,7 @@ ISR(TIMER1_COMPA_vect) {
           noInterrupts();
           fifo.add(pin);
           interrupts();
-          sendEvent(true, pin);
+          sendEvent(true, pin, avg);  // KIRIM DENGAN NILAI ANALOG
         }
       }
     } else if (avg < THRESHOLD_LOW) {
@@ -231,7 +248,7 @@ ISR(TIMER1_COMPA_vect) {
           noInterrupts();
           fifo.remove(pin);
           interrupts();
-          sendEvent(false, pin);
+          sendEvent(false, pin, 0);  // DEAKTIVASI tanpa nilai analog
         }
       }
     }
@@ -259,7 +276,7 @@ void setup() {
   while (!Serial && millis() < 3000)
     ;
   Serial.println(F("\n=== 7-MUX 108-CH 24/7 ROBUST ==="));
-  Serial.println(F("=== Creted by: WahyuCF, RAffi, Orang Pintar ==="));
+  Serial.println(F("=== Created by: WahyuCF, RAffi, Orang Pintar ==="));
   Serial.println(F("=== September 2025 ===\n"));
 
   for (int i = 0; i < 4; i++) pinMode(muxControlPins[i], OUTPUT);
@@ -272,7 +289,7 @@ void setup() {
   fifo.reset();
   for (int m = 0; m < NUM_MUX; m++)
     for (int c = 0; c < CHANNELS_PER_MUX; c++)
-      channels[m][c] = { false, 0, 0, 0, 0 };
+      channels[m][c] = { false, 0, 0, 0, 0, 0 };  // tambah field lastAnalogValue
 
   // Timer1 1ms
   noInterrupts();
@@ -336,7 +353,6 @@ void loop() {
 
   // Heartbeat
   if (timeElapsed(lastHeartbeat, HEARTBEAT_INTERVAL)) {
-    //sendSerial(F("99%d"), 0);
     sendSerial(F("99"), 0);
     ledBlink(1, 50, 50);
   }
@@ -347,7 +363,15 @@ void loop() {
     noInterrupts();
     bool ok = fifo.getNext(pin);
     interrupts();
-    if (ok && pin >= 1 && pin <= TOTAL_CHANNELS) sendEvent(true, pin);
+    if (ok && pin >= 1 && pin <= TOTAL_CHANNELS) {
+      // TAMBAHAN: Ambil nilai analog dari channel yang aktif
+      int m = (pin - 1) / CHANNELS_PER_MUX;
+      int c = (pin - 1) % CHANNELS_PER_MUX;
+      if (m < NUM_MUX && c < CHANNELS_PER_MUX) {
+        int analogVal = channels[m][c].lastAnalogValue;
+        sendEvent(true, pin, analogVal);
+      }
+    }
   }
 
   // 24h baseline recal
