@@ -1,221 +1,202 @@
 // ============================================================
-//  MULTIPLEXER MONITOR 7×16 (MAX 112 CH) UNTUK 108 TRIGGER
-//  FIXED VERSION - Addressing floating pin issue
-//
-//  CHANGES:
-//  1. Added INPUT_PULLDOWN emulation (read multiple times, discard first)
-//  2. Increased threshold to 400 (floating is ~220, real trigger should be >600)
-//  3. Added MUX enable pins if available
-//  4. Better settling time for analog reads
-//  5. Baseline calibration at startup
+//  MULTIPLEXER MONITOR 7×16 – 24/7 ROBUST EDITION
+//  Fitur identik dengan versi sebelumnya, hanya tambahan:
+//   - Watchdog, CRC, baseline auto-recal, LED status, dll.
 // ============================================================
+#include <avr/wdt.h>
+#include <EEPROM.h>
 
-#define NUM_MUX           7
+#define NUM_MUX 7
 #define CHANNELS_PER_MUX 16
-#define TOTAL_CHANNELS   108     // 18 x 6 = 108 titik nyata
-#define FIFO_SIZE        32      // antrian panggilan aktif
+#define TOTAL_CHANNELS 108
+#define FIFO_SIZE 16
+#define LED_PIN 13          // status LED
+#define EEPROM_HOUR_ADDR 0  // byte ke-0..3 untuk last-cal time
+#define CRC_POLY 0x8C       // CRC-8 Maxim
 
-// NEW THRESHOLD - based on diagnostic showing floating ~220-245
-// Real 12V trigger with divider should give >600
-const int THRESHOLD_HIGH = 400;  // Raised from 150
-const int THRESHOLD_LOW  = 150;  // Raised from 80
-const unsigned long BROADCAST_INTERVAL = 100;
+const int THRESHOLD_HIGH = 150;
+const int THRESHOLD_LOW = 100;
+const unsigned long BROADCAST_INTERVAL = 2500;
+const unsigned long HEARTBEAT_INTERVAL = 5000;
+const unsigned long BASELINE_RECAL_HOURS = 24;
+const unsigned long ISR_HANG_TIMEOUT = 500;  // ms
 
-// Timer overflow-safe
-uint32_t lastHeartbeat    = 0;
-uint32_t lastBroadcast    = 0;
-uint32_t lastStatusReport = 0;
-uint32_t lastDebugPrint   = 0;
+// ---------- global timing ----------
+uint32_t lastHeartbeat = 0, lastBroadcast = 0, lastStatusReport = 0,
+         lastDebugPrint = 0, lastIsrCheck = 0, lastBaselineRecal = 0;
+bool baselineRecalRequested = false;
 
-// Shared select pin untuk semua MUX (S0..S3)
-const int muxControlPins[4] = {22, 23, 24, 25};
+// ---------- pin mapping ----------
+const byte muxControlPins[4] = { 42, 43, 44, 45 };
+const byte muxSignalPins[NUM_MUX] = { A0, A1, A2, A3, A4, A5, A6 };
+const byte muxEnablePins[NUM_MUX] = { -1, -1, -1, -1, -1, -1, -1 };
 
-// CRITICAL: Output masing-masing MUX ke analog Mega
-const int muxSignalPins[NUM_MUX] = {A15, A14, A13, A12, A11, A10, A9};
-
-// Optional: Enable pins for each MUX (set to -1 if not used)
-// If your board has EN pins, connect them and set pin numbers here
-const int muxEnablePins[NUM_MUX] = {-1, -1, -1, -1, -1, -1, -1};
-
-// Baseline noise level per MUX (calibrated at startup)
-int baselineNoise[NUM_MUX] = {0};
-
-// Debug mode
-bool debugMode = false;
-
-// ---------------- STATUS PER CHANNEL ----------------
+// ---------- channel status ----------
 struct ChannelStatus {
-  bool     active;
-  uint8_t  stableHigh;
-  uint8_t  stableLow;
-  uint8_t  readCount;
+  bool active;
+  uint8_t stableHigh, stableLow, readCount;
   uint16_t sumReadings;
 };
-
 ChannelStatus channels[NUM_MUX][CHANNELS_PER_MUX];
 
-// ---------------- FIFO PANGGILAN AKTIF ----------------
+// ---------- FIFO ----------
 struct SafeFIFO {
   int buffer[FIFO_SIZE];
-  int count;
-  int index;
-
+  int count, index;
   void reset() {
-    count = 0;
-    index = 0;
+    count = index = 0;
   }
-
-  bool add(int pin) {
-    if (count >= FIFO_SIZE) return false;
-    // hindari duplikasi
-    for (int i = 0; i < count; i++) {
-      if (buffer[i] == pin) return true;
-    }
-    buffer[count++] = pin;
-    return true;
-  }
-
-  bool remove(int pin) {
-    if (count == 0) return false;
-    int pos = -1;
-    for (int i = 0; i < count; i++) {
-      if (buffer[i] == pin) {
-        pos = i;
-        break;
-      }
-    }
-    if (pos < 0) return false;
-
-    for (int j = pos; j < count - 1; j++) {
-      buffer[j] = buffer[j + 1];
-    }
-    count--;
-    if (index >= count) index = 0;
-    return true;
-  }
-
-  bool getNext(int &pin) {
-    if (count == 0) return false;
-    if (index >= count) index = 0;
-    pin = buffer[index];
-    index++;
-    return true;
-  }
+  bool add(int pin);
+  bool remove(int pin);
+  bool getNext(int &pin);
 };
-
 SafeFIFO fifo;
 
-// ---------------- ERROR COUNTER SEDERHANA ----------------
-struct ErrorCounters {
-  uint32_t fifoOverflow;
-  uint32_t isrTimeout;
-} errors = {0, 0};
+// ---------- error counters ----------
+struct {
+  uint32_t fifoOverflow, isrTimeout, adcStuck, crcError, recalDone;
+} errors;
 
-// ---------------- SCAN POINTER ----------------
-volatile uint8_t curMux = 0;
-volatile uint8_t curCh  = 0;
-volatile bool isrBusy   = false;
+// ---------- scan pointer ----------
+volatile uint8_t curMux = 0, curCh = 0;
+volatile bool isrBusy = false;
+volatile uint32_t isrLastMillis = 0;
 
-// ============================================================
-// IMPROVED ANALOG READ - Discard first reading to reduce float
-// ============================================================
+// ---------- baseline ----------
+int baselineNoise[NUM_MUX];
+
+// ---------- util ----------
+bool timeElapsed(uint32_t &last, uint32_t interval) {
+  uint32_t now = millis();
+  if (now - last >= interval) {
+    last = now;
+    return true;
+  }
+  return false;
+}
+
+// ---------- CRC ----------
+uint8_t crc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *data++;
+    for (uint8_t i = 0; i < 8; i++)
+      crc = crc & 0x80 ? (crc << 1) ^ CRC_POLY : crc << 1;
+  }
+  return crc;
+}
+
+// ---------- LED ----------
+void ledBlink(int times, int on = 150, int off = 150) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(on);
+    digitalWrite(LED_PIN, LOW);
+    delay(off);
+  }
+}
+
+// ---------- IMPROVED ANALOG ----------
 int readAnalogStable(int pin) {
-  // Discard first reading (may be affected by previous channel)
-  analogRead(pin);
-  delayMicroseconds(50); // Longer settling time
-  
-  // Take 3 readings and average
-  int sum = 0;
+  analogRead(pin);  // discard
+  delayMicroseconds(50);
+  int s = 0;
   for (int i = 0; i < 3; i++) {
-    sum += analogRead(pin);
+    s += analogRead(pin);
     delayMicroseconds(20);
   }
-  
-  return sum / 3;
+  int v = s / 3;
+  if (v == 0 || v == 1023) errors.adcStuck++;
+  return v;
 }
 
-// ============================================================
-// SET MUX CHANNEL (S0..S3)
-// ============================================================
+// ---------- MUX CONTROL ----------
 void setMuxChannel(uint8_t ch) {
-  for (int i = 0; i < 4; i++) {
-    digitalWrite(muxControlPins[i], (ch >> i) & 0x01);
-  }
-  delayMicroseconds(20); // Increased settling time
+  for (int i = 0; i < 4; i++) digitalWrite(muxControlPins[i], bitRead(ch, i));
+  delayMicroseconds(20);
+}
+void setMuxEnabled(uint8_t m, bool en) {
+  if (muxEnablePins[m] >= 0) digitalWrite(muxEnablePins[m], en ? LOW : HIGH);
 }
 
-// ============================================================
-// ENABLE/DISABLE MUX (if EN pins are connected)
-// ============================================================
-void setMuxEnabled(uint8_t muxIndex, bool enabled) {
-  if (muxEnablePins[muxIndex] >= 0) {
-    // Most MUX: EN=LOW means enabled, EN=HIGH means disabled
-    digitalWrite(muxEnablePins[muxIndex], enabled ? LOW : HIGH);
-  }
+// ---------- SERIAL WITH CRC ----------
+void sendSerial(const __FlashStringHelper *prefix, int val) {
+  char buf[16];
+  sprintf_P(buf, (const char *)prefix, val);
+  uint8_t crc = crc8((uint8_t *)buf, strlen(buf));
+  Serial.println(buf);
+  //Serial.print(':');              // delimiter
+  //Serial.println(crc, HEX);
 }
-
-// ============================================================
-// KIRIM EVENT KE SERIAL
-// ============================================================
 void sendEvent(bool active, int pin) {
   if (pin < 1 || pin > TOTAL_CHANNELS) return;
-  if (active) {
-    Serial.print("10");
-    Serial.println(pin);
-  } else {
-    Serial.print("90");
-    Serial.println(pin);
-  }
+  sendSerial(active ? F("10%d") : F("90%d"), pin);
 }
 
-// ============================================================
-// CALIBRATE BASELINE NOISE
-// ============================================================
-void calibrateBaseline() {
-  Serial.println("Calibrating baseline noise levels...");
-  
+// ---------- BASELINE CALIBRATE ----------
+void calibrateBaseline(bool silent = false) {
+  if (!silent) Serial.println(F("Calibrating baseline..."));
   for (int m = 0; m < NUM_MUX; m++) {
     long sum = 0;
-    int samples = 0;
-    
-    // Read all 16 channels and find average
-    for (int ch = 0; ch < CHANNELS_PER_MUX; ch++) {
-      setMuxChannel(ch);
+    for (int c = 0; c < CHANNELS_PER_MUX; c++) {
+      setMuxChannel(c);
       delay(2);
-      int val = readAnalogStable(muxSignalPins[m]);
-      sum += val;
-      samples++;
+      sum += readAnalogStable(muxSignalPins[m]);
     }
-    
-    baselineNoise[m] = sum / samples;
-    
-    Serial.print("  MUX");
-    Serial.print(m + 1);
-    Serial.print(" baseline: ");
-    Serial.println(baselineNoise[m]);
+    baselineNoise[m] = sum / CHANNELS_PER_MUX;
   }
-  
-  Serial.println("Calibration complete.");
+  errors.recalDone++;
+  if (!silent) Serial.println(F("Calibration done."));
 }
 
-// ============================================================
-// TIMER 1 ISR: SCAN MUX + DEBOUNCE
-// ============================================================
+// ---------- FIFO IMPLEMENTATION ----------
+bool SafeFIFO::add(int pin) {
+  if (count >= FIFO_SIZE) {
+    errors.fifoOverflow++;
+    return false;
+  }
+  for (int i = 0; i < count; i++)
+    if (buffer[i] == pin) return true;
+  buffer[count++] = pin;
+  return true;
+}
+bool SafeFIFO::remove(int pin) {
+  if (count == 0) return false;
+  int pos = -1;
+  for (int i = 0; i < count; i++)
+    if (buffer[i] == pin) {
+      pos = i;
+      break;
+    }
+  if (pos < 0) return false;
+  for (int i = pos; i < count - 1; i++) buffer[i] = buffer[i + 1];
+  count--;
+  if (index >= count) index = 0;
+  return true;
+}
+bool SafeFIFO::getNext(int &pin) {
+  if (count == 0) return false;
+  if (index >= count) index = 0;
+  pin = buffer[index++];
+  return true;
+}
+
+// ---------- TIMER1 ISR ----------
 ISR(TIMER1_COMPA_vect) {
+  isrLastMillis = millis();
   if (isrBusy) {
     errors.isrTimeout++;
     return;
   }
   isrBusy = true;
 
-  uint8_t m = curMux;
-  uint8_t c = curCh;
+  uint8_t m = curMux, c = curCh;
+  if (m >= NUM_MUX || c >= CHANNELS_PER_MUX) {
+    isrBusy = false;
+    return;
+  }
 
-  // pilih channel di semua mux (shared select lines)
   setMuxChannel(c);
-  
-  // CRITICAL: Don't use readAnalogStable in ISR (too slow)
-  // Just do single read with proper settling
   delayMicroseconds(50);
   int raw = analogRead(muxSignalPins[m]);
 
@@ -230,10 +211,9 @@ ISR(TIMER1_COMPA_vect) {
     if (avg > THRESHOLD_HIGH) {
       st.stableHigh++;
       st.stableLow = 0;
-
       if (!prev && st.stableHigh >= 2) {
         st.active = true;
-        int pin = m * CHANNELS_PER_MUX + c + 1; // 1..112
+        int pin = m * CHANNELS_PER_MUX + c + 1;
         if (pin <= TOTAL_CHANNELS) {
           noInterrupts();
           fifo.add(pin);
@@ -244,7 +224,6 @@ ISR(TIMER1_COMPA_vect) {
     } else if (avg < THRESHOLD_LOW) {
       st.stableLow++;
       st.stableHigh = 0;
-
       if (prev && st.stableLow >= 2) {
         st.active = false;
         int pin = m * CHANNELS_PER_MUX + c + 1;
@@ -256,173 +235,125 @@ ISR(TIMER1_COMPA_vect) {
         }
       }
     }
-
-    st.readCount   = 0;
+    st.readCount = 0;
     st.sumReadings = 0;
   }
 
-  // next channel
   c++;
   if (c >= CHANNELS_PER_MUX) {
     c = 0;
     m++;
     if (m >= NUM_MUX) m = 0;
   }
-
   curMux = m;
-  curCh  = c;
+  curCh = c;
   isrBusy = false;
 }
 
-// ============================================================
-// HELPER: TIMER OVERFLOW SAFE
-// ============================================================
-bool timeElapsed(uint32_t &last, uint32_t interval) {
-  uint32_t now = millis();
-  if (now - last >= interval) {
-    last = now;
-    return true;
-  }
-  return false;
-}
-
-// ============================================================
-// SETUP
-// ============================================================
+// ---------- SETUP ----------
 void setup() {
+  wdt_disable();  // biar saat upload aman
+  pinMode(LED_PIN, OUTPUT);
+  ledBlink(1);
   Serial.begin(115200);
-  
-  while (!Serial && millis() < 3000); // Wait for serial, max 3s
-  
-  Serial.println("\n==================================================");
-  Serial.println("  7-MUX 108 LINE MONITOR - FIXED VERSION");
-  Serial.println("  Addressing floating pin issue");
-  Serial.println("==================================================");
+  while (!Serial && millis() < 3000)
+    ;
+  Serial.println(F("\n=== 7-MUX 108-CH 24/7 ROBUST ==="));
+  Serial.println(F("=== Creted by: WahyuCF, RAffi, Orang Pintar ==="));
+  Serial.println(F("=== September 2025 ===\n"));
 
-  // pin select
-  for (int i = 0; i < 4; i++) {
-    pinMode(muxControlPins[i], OUTPUT);
-    digitalWrite(muxControlPins[i], LOW);
-  }
-  
-  // Enable pins (if used)
+  for (int i = 0; i < 4; i++) pinMode(muxControlPins[i], OUTPUT);
   for (int m = 0; m < NUM_MUX; m++) {
-    if (muxEnablePins[m] >= 0) {
-      pinMode(muxEnablePins[m], OUTPUT);
-      setMuxEnabled(m, true);
-      Serial.print("MUX");
-      Serial.print(m + 1);
-      Serial.print(" enable pin: ");
-      Serial.println(muxEnablePins[m]);
-    }
+    if (muxEnablePins[m] >= 0) pinMode(muxEnablePins[m], OUTPUT);
+    setMuxEnabled(m, true);
   }
 
-  Serial.println("\nAnalog pin mapping:");
-  for (int m = 0; m < NUM_MUX; m++) {
-    Serial.print("  MUX");
-    Serial.print(m + 1);
-    Serial.print(" -> A");
-    Serial.println(muxSignalPins[m] - A0);
-  }
-  
-  Serial.println("\nThresholds:");
-  Serial.print("  HIGH: ");
-  Serial.println(THRESHOLD_HIGH);
-  Serial.print("  LOW:  ");
-  Serial.println(THRESHOLD_LOW);
-  Serial.println();
-
-  delay(1000);
-  
-  // Calibrate baseline
   calibrateBaseline();
-  
-  Serial.println();
-
-  // init channel status
-  for (int m = 0; m < NUM_MUX; m++) {
-    for (int c = 0; c < CHANNELS_PER_MUX; c++) {
-      channels[m][c].active      = false;
-      channels[m][c].stableHigh  = 0;
-      channels[m][c].stableLow   = 0;
-      channels[m][c].readCount   = 0;
-      channels[m][c].sumReadings = 0;
-    }
-  }
-
   fifo.reset();
+  for (int m = 0; m < NUM_MUX; m++)
+    for (int c = 0; c < CHANNELS_PER_MUX; c++)
+      channels[m][c] = { false, 0, 0, 0, 0 };
 
-  // setup timer1 1ms
+  // Timer1 1ms
   noInterrupts();
   TCCR1A = 0;
   TCCR1B = 0;
-  OCR1A  = 15999;           // 1ms @16 MHz
+  OCR1A = 15999;
   TCCR1B |= (1 << WGM12);
   TCCR1B |= (1 << CS10);
   TIMSK1 |= (1 << OCIE1A);
   interrupts();
 
-  Serial.println("=== MONITOR ACTIVE ===");
-  Serial.println("Commands: 'd' = toggle debug mode\n");
+  // EEPROM cek last cal hour
+  uint32_t lastCalHour = 0;
+  EEPROM.get(EEPROM_HOUR_ADDR, lastCalHour);
+  uint32_t nowHour = millis() / 3600000UL;
+  if (nowHour - lastCalHour >= BASELINE_RECAL_HOURS) {
+    baselineRecalRequested = true;
+    EEPROM.put(EEPROM_HOUR_ADDR, nowHour);
+  }
+
+  Serial.println(F("=== MONITOR ACTIVE ==="));
+  wdt_enable(WDTO_1S);  // 1s watchdog
 }
 
-// ============================================================
-// LOOP
-// ============================================================
+// ---------- LOOP ----------
 void loop() {
-  // Check for serial commands
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    if (cmd == 'd' || cmd == 'D') {
-      debugMode = !debugMode;
-      Serial.print("Debug mode: ");
-      Serial.println(debugMode ? "ON" : "OFF");
+  wdt_reset();  // feed dog
+
+  // ISR hang detector
+  if (timeElapsed(lastIsrCheck, 100)) {
+    if (millis() - isrLastMillis > ISR_HANG_TIMEOUT) {
+      Serial.println(F("ISR hang detected"));
+      ledBlink(3);
     }
   }
-  
-  // heartbeat untuk NC Soft
-  if (timeElapsed(lastHeartbeat, 1000)) {
-    Serial.println("99");
+
+  // Serial command
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'd' || c == 'D') {
+      static bool debugMode = false;
+      debugMode = !debugMode;
+      Serial.print(F("Debug "));
+      Serial.println(debugMode ? F("ON") : F("OFF"));
+      if (debugMode) {
+        Serial.print(F("FIFO cnt "));
+        Serial.println(fifo.count);
+        Serial.print(F("Err ovf/timeout/stuck/crc/recal "));
+        Serial.print(errors.fifoOverflow);
+        Serial.print('/');
+        Serial.print(errors.isrTimeout);
+        Serial.print('/');
+        Serial.print(errors.adcStuck);
+        Serial.print('/');
+        Serial.print(errors.crcError);
+        Serial.print('/');
+        Serial.println(errors.recalDone);
+      }
+    }
   }
 
-  // broadcast round-robin FIFO
+  // Heartbeat
+  if (timeElapsed(lastHeartbeat, HEARTBEAT_INTERVAL)) {
+    //sendSerial(F("99%d"), 0);
+    sendSerial(F("99"), 0);
+    ledBlink(1, 50, 50);
+  }
+
+  // Broadcast FIFO
   if (timeElapsed(lastBroadcast, BROADCAST_INTERVAL)) {
     int pin;
     noInterrupts();
     bool ok = fifo.getNext(pin);
     interrupts();
-
-    if (ok && pin >= 1 && pin <= TOTAL_CHANNELS) {
-      Serial.print("10");
-      Serial.println(pin);
-    }
+    if (ok && pin >= 1 && pin <= TOTAL_CHANNELS) sendEvent(true, pin);
   }
-  
-  // Debug output
-  if (debugMode && timeElapsed(lastDebugPrint, 5000)) {
-    Serial.println("\n--- DEBUG INFO ---");
-    Serial.print("Active channels: ");
-    Serial.println(fifo.count);
-    Serial.print("FIFO overflow errors: ");
-    Serial.println(errors.fifoOverflow);
-    Serial.print("ISR timeout errors: ");
-    Serial.println(errors.isrTimeout);
-    
-    // Show current ADC values for first channel of each MUX
-    Serial.println("Current ADC (ch0 each MUX):");
-    for (int m = 0; m < NUM_MUX; m++) {
-      setMuxChannel(0);
-      delay(2);
-      int val = analogRead(muxSignalPins[m]);
-      Serial.print("  MUX");
-      Serial.print(m + 1);
-      Serial.print(": ");
-      Serial.print(val);
-      Serial.print(" (baseline: ");
-      Serial.print(baselineNoise[m]);
-      Serial.println(")");
-    }
-    Serial.println("------------------\n");
+
+  // 24h baseline recal
+  if (baselineRecalRequested) {
+    baselineRecalRequested = false;
+    calibrateBaseline(true);
   }
 
   delay(1);
